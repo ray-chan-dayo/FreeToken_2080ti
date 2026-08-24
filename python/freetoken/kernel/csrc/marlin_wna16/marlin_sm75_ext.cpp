@@ -6,7 +6,7 @@
  *   marlin_mm(A, B, s, sorted_token_ids, expert_ids, num_tokens_post_padded,
  *             topk_weights, top_k, mul_topk_weights) -> torch.Tensor
  *
- * which calls the generated marlin_mm() from ops.cu with the sm_75-specific
+ * which calls marlin_moe_wna16::marlin_mm() from ops.cu with the sm_75-specific
  * (stages=2) kernel instantiations.
  *
  * The kernel files (ops.cu, marlin_template.h, sm75_kernel_*.cu,
@@ -17,9 +17,11 @@
 
 #include <torch/extension.h>
 
-// Forward declaration — implemented in ops.cu (pulled in via the CUDAExtension
-// sources list). The actual symbol lives in namespace marlin_moe_wna16.
-torch::Tensor marlin_sm75_mm(
+// Forward declaration of the symbol defined in ops.cu.
+// The implementation lives in namespace marlin_moe_wna16; declare it there so
+// the linker finds the right symbol without a name-mangling mismatch.
+namespace marlin_moe_wna16 {
+torch::Tensor marlin_mm(
     const torch::Tensor& A,
     const torch::Tensor& B,
     const torch::Tensor& s,
@@ -30,12 +32,13 @@ torch::Tensor marlin_sm75_mm(
     int64_t              top_k,
     bool                 mul_topk_weights
 );
+}  // namespace marlin_moe_wna16
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FreeToken Marlin WNA16 sm_75 MoE extension (stages=2, FP16/INT8 activation)";
     m.def(
         "marlin_mm",
-        &marlin_sm75_mm,
+        &marlin_moe_wna16::marlin_mm,
         "Marlin WNA16 fused MoE GEMM for sm_75 (Turing, stages=2)",
         py::arg("A"),
         py::arg("B"),

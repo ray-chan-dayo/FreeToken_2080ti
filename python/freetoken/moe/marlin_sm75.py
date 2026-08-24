@@ -82,6 +82,14 @@ def fused_experts_marlin_sm75(
     ``marlin_permute`` / ``marlin_permute_scales`` at load time). This function
     is the hot-path forward; weight repacking happens once at model load, not here.
 
+    Weight application convention (mirrors the standard Triton path in fused.py):
+    - ``apply_router_weight_on_input=True``: multiply topk_weights into the gate+up
+      projection (first GEMM, ``mul_topk_weights=True``).
+    - ``apply_router_weight_on_input=False`` (default): multiply topk_weights into the
+      down projection (second GEMM, ``mul_topk_weights=True``).
+    In both cases the kernel handles the weight multiply entirely; no Python-side
+    rescaling is performed after the kernel call.
+
     Returns ``[M, K]`` float16 — same shape and dtype as ``hidden_states``.
     """
     from freetoken.kernel import _marlin_sm75
@@ -91,13 +99,15 @@ def fused_experts_marlin_sm75(
     E = w1.shape[0]
     top_k = topk_ids.shape[1]
 
-    # Flatten topk_ids for the Marlin MoE dispatch kernel.
+    # One sort for both GEMMs: ``intermediate`` rows come out of the gate+up kernel in
+    # sorted_token_ids order, so the down projection must use the same alignment tensors.
+    # Calling moe_align_block_size a second time with different input would produce a
+    # different block-padding boundary and row permutation, corrupting the down GEMM.
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, block_size=16, num_experts=E
     )
 
-    # Marlin MoE forward: gate+up projection
-    # Output: [M * top_k, 2 * intermediate_size] float16
+    # Gate+up projection  →  [M * top_k, 2 * intermediate_size] float16
     gate_up_out = _marlin_sm75.marlin_mm(
         hidden_states,          # A: [M, K]
         w1,                     # B: packed INT4 gate+up weights
@@ -119,28 +129,27 @@ def fused_experts_marlin_sm75(
     )
     _ACT[activation](gate_up_out, intermediate)
 
-    # Down projection
-    # Output: [M * top_k, K] float16
-    down_sorted_ids, down_expert_ids, down_num_tokens = moe_align_block_size(
-        topk_ids.reshape(-1, 1), block_size=16, num_experts=E
-    )
+    # Down projection  →  [M * top_k, K] float16
+    # Reuse sorted_token_ids/expert_ids/num_tokens_post_padded from the gate+up pass:
+    # ``intermediate`` rows are already in that order.  A fresh sort here would give a
+    # different permutation and the kernel would read the wrong activation rows.
+    #
+    # Weight application: the kernel applies topk_weights when mul_topk_weights=True.
+    # No Python-side rescaling follows — doing both would double-apply the weights.
     out_flat = _marlin_sm75.marlin_mm(
         intermediate,           # A: [M * top_k, intermediate_size]
         w2,                     # B: packed INT4 down weights
         w2_scales,
-        down_sorted_ids,
-        down_expert_ids,
-        down_num_tokens,
+        sorted_token_ids,       # same alignment as gate+up — intermediate is in this order
+        expert_ids,
+        num_tokens_post_padded,
         topk_weights,
-        1,                      # top_k=1 for down projection (already expanded)
+        top_k,                  # full top_k (kernel scatters into [M, top_k, K] view)
         mul_topk_weights=not apply_router_weight_on_input,
     )  # → [M * top_k, K]
 
-    # Weighted sum over top_k dimension → [M, K]
-    out = out_flat.view(M, top_k, K)
-    if not apply_router_weight_on_input:
-        out = out * topk_weights.unsqueeze(-1).to(torch.float16)
-    return out.sum(dim=1)
+    # Sum the top_k expert contributions per token  →  [M, K]
+    return out_flat.view(M, top_k, K).sum(dim=1)
 
 
 __all__ = [
