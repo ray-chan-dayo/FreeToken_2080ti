@@ -38,6 +38,9 @@ class MoELayer(BaseOP):
         apply_router_weight_on_input: bool = False,
         allocate_experts: bool = True,
         weight_format: str = "bf16",
+        # group_size for marlin_int4 (AWQ/GPTQ INT4 on sm_75). Ignored for
+        # other formats. Standard AWQ/GPTQ checkpoints use group_size=128.
+        marlin_group_size: int = 128,
     ):
         super().__init__()
 
@@ -53,6 +56,7 @@ class MoELayer(BaseOP):
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.weight_format = weight_format
+        self.marlin_group_size = marlin_group_size
         intermediate_size_per_partition = div_even(intermediate_size, tp_size)
         if allocate_experts:
             self._alloc_resident_experts(intermediate_size_per_partition)
@@ -76,6 +80,28 @@ class MoELayer(BaseOP):
             )
             self.down_proj = torch.empty(n, h, i, dtype=FP8)
             self.down_scale_inv = torch.empty(n, h // blk, i // blk, dtype=torch.bfloat16)
+            return
+        if self.weight_format == "marlin_int4":
+            # Marlin-tiled INT4 experts for sm_75 (Turing) GPUs.
+            # Weights are repacked at load time by marlin_permute / marlin_permute_scales.
+            # Layout (mirrors the fused_experts_marlin_sm75 docstring):
+            #   gate_up_proj:   [E, 2*I//8,      H//16     ] int32
+            #   gate_up_scales: [E, 2*I//g,       H//16     ] float16   (g = group_size)
+            #   down_proj:      [E, H//8,          I//16     ] int32
+            #   down_scales:    [E, I//g,          H//16     ] float16
+            # TP is not supported for this format (sm_75 targets are single-node, small
+            # model fits in 4×22 GB; TP=1 assumption lets us skip the partition arithmetic).
+            assert self.tp_size == 1, (
+                "marlin_int4 weight format does not support tensor parallelism (tp_size > 1)"
+            )
+            E = self.num_experts
+            I = intermediate_size_per_partition  # == self.intermediate_size when tp_size==1
+            H = self.hidden_size
+            g = self.marlin_group_size
+            self.gate_up_proj = torch.empty(E, 2 * I // 8, H // 16, dtype=torch.int32)
+            self.gate_up_scales = torch.empty(E, 2 * I // g, H // 16, dtype=torch.float16)
+            self.down_proj = torch.empty(E, H // 8, I // 16, dtype=torch.int32)
+            self.down_scales = torch.empty(E, I // g, H // 16, dtype=torch.float16)
             return
         assert self.weight_format == "bf16", (
             f"no resident expert allocation for weight_format {self.weight_format!r}"
@@ -138,6 +164,21 @@ class MoELayer(BaseOP):
             return fused_experts_decode_fp8_block(
                 hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
                 self.down_proj, self.down_scale_inv, topk_weights, topk_ids,
+            )
+        if self.weight_format == "marlin_int4":
+            # Marlin WNA16 fused MoE for sm_75 (Turing) GPUs.
+            # Weights are pre-packed at load time; scales held in gate_up_scales/down_scales.
+            from freetoken.moe.marlin_sm75 import fused_experts_marlin_sm75
+            return fused_experts_marlin_sm75(
+                hidden_states,
+                self.gate_up_proj,
+                self.down_proj,
+                self.gate_up_scales,
+                self.down_scales,
+                topk_weights,
+                topk_ids,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
             )
         assert self.weight_format == "bf16", (
             f"no resident expert kernel for weight_format {self.weight_format!r}"

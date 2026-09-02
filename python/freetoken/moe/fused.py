@@ -202,7 +202,8 @@ def fused_experts_impl(
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
-    not shared; the resident bf16 path routes decode through here too."""
+    not shared; the resident bf16 path routes decode through here too.
+    """
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
