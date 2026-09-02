@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import sys
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension, CUDAExtension
 
@@ -174,6 +176,17 @@ setup(
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
+        # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        *([
+            CppExtension(
+                name="freetoken.kernel._ple_store",
+                sources=[
+                    "python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp",
+                ],
+                extra_compile_args=["-O3", "-std=c++17"],
+            )
+        ] if sys.platform == "linux" else []),
     ] + _marlin_sm75_ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+)lass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
