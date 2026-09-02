@@ -188,5 +188,4 @@ setup(
         ] if sys.platform == "linux" else []),
     ] + _marlin_sm75_ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
-)lass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
